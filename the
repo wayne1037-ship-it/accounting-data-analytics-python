@@ -1,0 +1,123 @@
+# 🍎 Apple Inc. (AAPL) — Financial Intelligence Core Analysis
+# FY2023 – FY2025 | Core Python
+
+import subprocess
+subprocess.run(['pip','install','yfinance','--upgrade','-q'])
+subprocess.run(['pip','install','plotly','--upgrade','-q'])
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import sqlite3
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── Global style
+GOLD, BLUE, GREEN, RED, PURPLE = '#C9A84C','#4A9EFF','#2ECC71','#E05252','#A78BFA'
+BG, SURFACE, BORDER = '#0A0C10','#111318','#1E2330'
+plt.rcParams.update({'axes.facecolor':'#0E1117','figure.facecolor':BG,'text.color':'#E8EAF0',
+                     'axes.labelcolor':'#9AA0B0','xtick.color':'#9AA0B0','ytick.color':'#9AA0B0',
+                     'axes.edgecolor':BORDER,'grid.color':BORDER,
+                     'axes.spines.top':False,'axes.spines.right':False})
+
+print('📅 Analysis run:', datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+# ── Parameters
+TICKER = 'AAPL'
+START, END = '2023-01-01','2025-12-31'
+
+# ── Fetch data
+aapl = yf.Ticker(TICKER)
+
+df_price = aapl.history(start=START,end=END).reset_index()
+df_price['Date'] = pd.to_datetime(df_price['Date']).dt.tz_localize(None)
+df_price['MA_50'] = df_price['Close'].rolling(50).mean()
+df_price['MA_200'] = df_price['Close'].rolling(200).mean()
+df_price['Daily_Return'] = df_price['Close'].pct_change()*100
+df_price['Cumulative_Return'] = (1 + df_price['Close'].pct_change()).cumprod() - 1
+
+# ── Quarterly Financials
+def process_quarters(df, cols_wanted):
+    df = df.T.copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df = df[(df.index >= START) & (df.index <= END)]
+    cols = [c for c in cols_wanted if c in df.columns]
+    df_proc = df[cols].copy()
+    for c in cols:
+        df_proc[c] = pd.to_numeric(df_proc[c],errors='coerce')/1e9
+    df_proc['Quarter'] = df_proc.index.to_period('Q').astype(str)
+    return df_proc
+
+df_income = process_quarters(aapl.quarterly_financials,
+                             ['Total Revenue','Gross Profit','Operating Income','Net Income','EBITDA'])
+df_income['Gross_Margin'] = (df_income['Gross Profit']/df_income['Total Revenue']*100).round(2)
+df_income['Op_Margin'] = (df_income['Operating Income']/df_income['Total Revenue']*100).round(2)
+df_income['Net_Margin'] = (df_income['Net Income']/df_income['Total Revenue']*100).round(2)
+df_income['Revenue_YoY'] = df_income['Total Revenue'].pct_change(4).mul(100).round(2)
+df_income['Revenue_QoQ'] = df_income['Total Revenue'].pct_change(1).mul(100).round(2)
+if 'EBITDA' in df_income.columns:
+    df_income['EBITDA_Margin'] = (df_income['EBITDA']/df_income['Total Revenue']*100).round(2)
+
+df_balance = process_quarters(aapl.quarterly_balance_sheet,
+                              ['Total Assets','Total Liabilities Net Minority Interest','Stockholders Equity','Total Debt','Current Assets','Current Liabilities','Cash And Cash Equivalents'])
+df_balance['Debt_Ratio'] = (df_balance['Total Liabilities Net Minority Interest']/df_balance['Total Assets']*100).round(2)
+df_balance['Current_Ratio'] = (df_balance['Current Assets']/df_balance['Current Liabilities']).round(3)
+df_balance['D_to_E'] = (df_balance.get('Total Debt',np.nan)/df_balance['Stockholders Equity']).round(3)
+
+df_cf = process_quarters(aapl.quarterly_cashflow,
+                         ['Operating Cash Flow','Capital Expenditure','Free Cash Flow','Repurchase Of Capital Stock','Cash Dividends Paid'])
+if 'Free Cash Flow' not in df_cf.columns:
+    df_cf['Free Cash Flow'] = df_cf['Operating Cash Flow'] + df_cf['Capital Expenditure']
+df_cf['FCF_Margin'] = (df_cf['Free Cash Flow']/df_income['Total Revenue'].reindex(df_cf.index)*100).round(2)
+
+# ── SQLite DB
+DB_PATH = 'apple_financial.db'
+conn = sqlite3.connect(DB_PATH)
+df_price.to_sql('stock_price',conn,if_exists='replace',index=False)
+df_income.to_sql('income_stmt',conn,if_exists='replace',index=True,index_label='Date')
+df_balance.to_sql('balance_sheet',conn,if_exists='replace',index=True,index_label='Date')
+df_cf.to_sql('cash_flow',conn,if_exists='replace',index=True,index_label='Date')
+conn.close()
+
+# ── Annual Aggregation
+df_income['FY'] = df_income.index.year
+annual = df_income.groupby('FY').agg(
+    Annual_Revenue=('Total Revenue','sum'),
+    Annual_NetIncome=('Net Income','sum'),
+    Avg_Gross_Margin=('Gross_Margin','mean'),
+    Avg_Net_Margin=('Net_Margin','mean'),
+    Avg_Op_Margin=('Op_Margin','mean')
+).round(2)
+annual['Revenue_Growth_YoY'] = annual['Annual_Revenue'].pct_change().mul(100).round(2)
+
+# ── Plotly Interactive Dashboard (Quarterly)
+Q = df_income['Quarter'].tolist()
+fig = make_subplots(rows=2,cols=2,subplot_titles=['Revenue (USD Bn)','Margins (%)','FCF (USD Bn)','Stock Price (USD)'])
+fig.add_trace(go.Bar(x=Q,y=df_income['Total Revenue'],name='Revenue',marker_color=GOLD),row=1,col=1)
+for col, nm, c in [('Gross_Margin','Gross%',GREEN),('Op_Margin','Op%',GOLD),('Net_Margin','Net%',PURPLE)]:
+    fig.add_trace(go.Scatter(x=Q,y=df_income[col],mode='lines+markers',name=nm,line=dict(color=c,width=2)),row=1,col=2)
+fig.add_trace(go.Bar(x=df_cf['Quarter'],y=df_cf['Free Cash Flow'],name='FCF',marker_color=GREEN),row=2,col=1)
+fig.add_trace(go.Scatter(x=df_price['Date'],y=df_price['Close'],name='Close',line=dict(color=GOLD,width=2)),row=2,col=2)
+fig.update_layout(template='plotly_dark',height=800)
+fig.show()
+
+# ── Matplotlib Static Annual Summary
+fig, ax = plt.subplots(1,3,figsize=(18,5))
+fig.patch.set_facecolor(BG)
+fy_labels = annual.index.astype(str).tolist()
+ax[0].bar(fy_labels,annual['Annual_Revenue'],color=BLUE); ax[0].set_title('Annual Revenue (USD Bn)',color=GOLD)
+ax[1].bar(fy_labels,annual['Annual_NetIncome'],color=PURPLE); ax[1].set_title('Annual Net Income (USD Bn)',color=GOLD)
+w = 0.25
+x = np.arange(len(fy_labels))
+ax[2].bar(x-w,annual['Avg_Gross_Margin'],w,color=GREEN,label='Gross%')
+ax[2].bar(x,annual['Avg_Op_Margin'],w,color=GOLD,label='Op%')
+ax[2].bar(x+w,annual['Avg_Net_Margin'],w,color=PURPLE,label='Net%')
+ax[2].set_xticks(x); ax[2].set_xticklabels(fy_labels); ax[2].set_title('Average Margins (%)',color=GOLD); ax[2].legend()
+plt.show()
